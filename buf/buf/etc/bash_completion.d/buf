@@ -1,0 +1,4757 @@
+# bash completion for buf                                  -*- shell-script -*-
+
+__buf_debug()
+{
+    if [[ -n ${BASH_COMP_DEBUG_FILE:-} ]]; then
+        echo "$*" >> "${BASH_COMP_DEBUG_FILE}"
+    fi
+}
+
+# Homebrew on Macs have version 1.3 of bash-completion which doesn't include
+# _init_completion. This is a very minimal version of that function.
+__buf_init_completion()
+{
+    COMPREPLY=()
+    _get_comp_words_by_ref "$@" cur prev words cword
+}
+
+__buf_index_of_word()
+{
+    local w word=$1
+    shift
+    index=0
+    for w in "$@"; do
+        [[ $w = "$word" ]] && return
+        index=$((index+1))
+    done
+    index=-1
+}
+
+__buf_contains_word()
+{
+    local w word=$1; shift
+    for w in "$@"; do
+        [[ $w = "$word" ]] && return
+    done
+    return 1
+}
+
+__buf_handle_go_custom_completion()
+{
+    __buf_debug "${FUNCNAME[0]}: cur is ${cur}, words[*] is ${words[*]}, #words[@] is ${#words[@]}"
+
+    local shellCompDirectiveError=1
+    local shellCompDirectiveNoSpace=2
+    local shellCompDirectiveNoFileComp=4
+    local shellCompDirectiveFilterFileExt=8
+    local shellCompDirectiveFilterDirs=16
+
+    local out requestComp lastParam lastChar comp directive args
+
+    # Prepare the command to request completions for the program.
+    # Calling ${words[0]} instead of directly buf allows handling aliases
+    args=("${words[@]:1}")
+    # Disable ActiveHelp which is not supported for bash completion v1
+    requestComp="BUF_ACTIVE_HELP=0 ${words[0]} __completeNoDesc ${args[*]}"
+
+    lastParam=${words[$((${#words[@]}-1))]}
+    lastChar=${lastParam:$((${#lastParam}-1)):1}
+    __buf_debug "${FUNCNAME[0]}: lastParam ${lastParam}, lastChar ${lastChar}"
+
+    if [ -z "${cur}" ] && [ "${lastChar}" != "=" ]; then
+        # If the last parameter is complete (there is a space following it)
+        # We add an extra empty parameter so we can indicate this to the go method.
+        __buf_debug "${FUNCNAME[0]}: Adding extra empty parameter"
+        requestComp="${requestComp} \"\""
+    fi
+
+    __buf_debug "${FUNCNAME[0]}: calling ${requestComp}"
+    # Use eval to handle any environment variables and such
+    out=$(eval "${requestComp}" 2>/dev/null)
+
+    # Extract the directive integer at the very end of the output following a colon (:)
+    directive=${out##*:}
+    # Remove the directive
+    out=${out%:*}
+    if [ "${directive}" = "${out}" ]; then
+        # There is not directive specified
+        directive=0
+    fi
+    __buf_debug "${FUNCNAME[0]}: the completion directive is: ${directive}"
+    __buf_debug "${FUNCNAME[0]}: the completions are: ${out}"
+
+    if [ $((directive & shellCompDirectiveError)) -ne 0 ]; then
+        # Error code.  No completion.
+        __buf_debug "${FUNCNAME[0]}: received error from custom completion go code"
+        return
+    else
+        if [ $((directive & shellCompDirectiveNoSpace)) -ne 0 ]; then
+            if [[ $(type -t compopt) = "builtin" ]]; then
+                __buf_debug "${FUNCNAME[0]}: activating no space"
+                compopt -o nospace
+            fi
+        fi
+        if [ $((directive & shellCompDirectiveNoFileComp)) -ne 0 ]; then
+            if [[ $(type -t compopt) = "builtin" ]]; then
+                __buf_debug "${FUNCNAME[0]}: activating no file completion"
+                compopt +o default
+            fi
+        fi
+    fi
+
+    if [ $((directive & shellCompDirectiveFilterFileExt)) -ne 0 ]; then
+        # File extension filtering
+        local fullFilter filter filteringCmd
+        # Do not use quotes around the $out variable or else newline
+        # characters will be kept.
+        for filter in ${out}; do
+            fullFilter+="$filter|"
+        done
+
+        filteringCmd="_filedir $fullFilter"
+        __buf_debug "File filtering command: $filteringCmd"
+        $filteringCmd
+    elif [ $((directive & shellCompDirectiveFilterDirs)) -ne 0 ]; then
+        # File completion for directories only
+        local subdir
+        # Use printf to strip any trailing newline
+        subdir=$(printf "%s" "${out}")
+        if [ -n "$subdir" ]; then
+            __buf_debug "Listing directories in $subdir"
+            __buf_handle_subdirs_in_dir_flag "$subdir"
+        else
+            __buf_debug "Listing directories in ."
+            _filedir -d
+        fi
+    else
+        while IFS='' read -r comp; do
+            COMPREPLY+=("$comp")
+        done < <(compgen -W "${out}" -- "$cur")
+    fi
+}
+
+__buf_handle_reply()
+{
+    __buf_debug "${FUNCNAME[0]}"
+    local comp
+    case $cur in
+        -*)
+            if [[ $(type -t compopt) = "builtin" ]]; then
+                compopt -o nospace
+            fi
+            local allflags
+            if [ ${#must_have_one_flag[@]} -ne 0 ]; then
+                allflags=("${must_have_one_flag[@]}")
+            else
+                allflags=("${flags[*]} ${two_word_flags[*]}")
+            fi
+            while IFS='' read -r comp; do
+                COMPREPLY+=("$comp")
+            done < <(compgen -W "${allflags[*]}" -- "$cur")
+            if [[ $(type -t compopt) = "builtin" ]]; then
+                [[ "${COMPREPLY[0]}" == *= ]] || compopt +o nospace
+            fi
+
+            # complete after --flag=abc
+            if [[ $cur == *=* ]]; then
+                if [[ $(type -t compopt) = "builtin" ]]; then
+                    compopt +o nospace
+                fi
+
+                local index flag
+                flag="${cur%=*}"
+                __buf_index_of_word "${flag}" "${flags_with_completion[@]}"
+                COMPREPLY=()
+                if [[ ${index} -ge 0 ]]; then
+                    PREFIX=""
+                    cur="${cur#*=}"
+                    ${flags_completion[${index}]}
+                    if [ -n "${ZSH_VERSION:-}" ]; then
+                        # zsh completion needs --flag= prefix
+                        eval "COMPREPLY=( \"\${COMPREPLY[@]/#/${flag}=}\" )"
+                    fi
+                fi
+            fi
+
+            if [[ -z "${flag_parsing_disabled}" ]]; then
+                # If flag parsing is enabled, we have completed the flags and can return.
+                # If flag parsing is disabled, we may not know all (or any) of the flags, so we fallthrough
+                # to possibly call handle_go_custom_completion.
+                return 0;
+            fi
+            ;;
+    esac
+
+    # check if we are handling a flag with special work handling
+    local index
+    __buf_index_of_word "${prev}" "${flags_with_completion[@]}"
+    if [[ ${index} -ge 0 ]]; then
+        ${flags_completion[${index}]}
+        return
+    fi
+
+    # we are parsing a flag and don't have a special handler, no completion
+    if [[ ${cur} != "${words[cword]}" ]]; then
+        return
+    fi
+
+    local completions
+    completions=("${commands[@]}")
+    if [[ ${#must_have_one_noun[@]} -ne 0 ]]; then
+        completions+=("${must_have_one_noun[@]}")
+    elif [[ -n "${has_completion_function}" ]]; then
+        # if a go completion function is provided, defer to that function
+        __buf_handle_go_custom_completion
+    fi
+    if [[ ${#must_have_one_flag[@]} -ne 0 ]]; then
+        completions+=("${must_have_one_flag[@]}")
+    fi
+    while IFS='' read -r comp; do
+        COMPREPLY+=("$comp")
+    done < <(compgen -W "${completions[*]}" -- "$cur")
+
+    if [[ ${#COMPREPLY[@]} -eq 0 && ${#noun_aliases[@]} -gt 0 && ${#must_have_one_noun[@]} -ne 0 ]]; then
+        while IFS='' read -r comp; do
+            COMPREPLY+=("$comp")
+        done < <(compgen -W "${noun_aliases[*]}" -- "$cur")
+    fi
+
+    if [[ ${#COMPREPLY[@]} -eq 0 ]]; then
+        if declare -F __buf_custom_func >/dev/null; then
+            # try command name qualified custom func
+            __buf_custom_func
+        else
+            # otherwise fall back to unqualified for compatibility
+            declare -F __custom_func >/dev/null && __custom_func
+        fi
+    fi
+
+    # available in bash-completion >= 2, not always present on macOS
+    if declare -F __ltrim_colon_completions >/dev/null; then
+        __ltrim_colon_completions "$cur"
+    fi
+
+    # If there is only 1 completion and it is a flag with an = it will be completed
+    # but we don't want a space after the =
+    if [[ "${#COMPREPLY[@]}" -eq "1" ]] && [[ $(type -t compopt) = "builtin" ]] && [[ "${COMPREPLY[0]}" == --*= ]]; then
+       compopt -o nospace
+    fi
+}
+
+# The arguments should be in the form "ext1|ext2|extn"
+__buf_handle_filename_extension_flag()
+{
+    local ext="$1"
+    _filedir "@(${ext})"
+}
+
+__buf_handle_subdirs_in_dir_flag()
+{
+    local dir="$1"
+    pushd "${dir}" >/dev/null 2>&1 && _filedir -d && popd >/dev/null 2>&1 || return
+}
+
+__buf_handle_flag()
+{
+    __buf_debug "${FUNCNAME[0]}: c is $c words[c] is ${words[c]}"
+
+    # if a command required a flag, and we found it, unset must_have_one_flag()
+    local flagname=${words[c]}
+    local flagvalue=""
+    # if the word contained an =
+    if [[ ${words[c]} == *"="* ]]; then
+        flagvalue=${flagname#*=} # take in as flagvalue after the =
+        flagname=${flagname%=*} # strip everything after the =
+        flagname="${flagname}=" # but put the = back
+    fi
+    __buf_debug "${FUNCNAME[0]}: looking for ${flagname}"
+    if __buf_contains_word "${flagname}" "${must_have_one_flag[@]}"; then
+        must_have_one_flag=()
+    fi
+
+    # if you set a flag which only applies to this command, don't show subcommands
+    if __buf_contains_word "${flagname}" "${local_nonpersistent_flags[@]}"; then
+      commands=()
+    fi
+
+    # keep flag value with flagname as flaghash
+    # flaghash variable is an associative array which is only supported in bash > 3.
+    if [[ -z "${BASH_VERSION:-}" || "${BASH_VERSINFO[0]:-}" -gt 3 ]]; then
+        if [ -n "${flagvalue}" ] ; then
+            flaghash[${flagname}]=${flagvalue}
+        elif [ -n "${words[ $((c+1)) ]}" ] ; then
+            flaghash[${flagname}]=${words[ $((c+1)) ]}
+        else
+            flaghash[${flagname}]="true" # pad "true" for bool flag
+        fi
+    fi
+
+    # skip the argument to a two word flag
+    if [[ ${words[c]} != *"="* ]] && __buf_contains_word "${words[c]}" "${two_word_flags[@]}"; then
+        __buf_debug "${FUNCNAME[0]}: found a flag ${words[c]}, skip the next argument"
+        c=$((c+1))
+        # if we are looking for a flags value, don't show commands
+        if [[ $c -eq $cword ]]; then
+            commands=()
+        fi
+    fi
+
+    c=$((c+1))
+
+}
+
+__buf_handle_noun()
+{
+    __buf_debug "${FUNCNAME[0]}: c is $c words[c] is ${words[c]}"
+
+    if __buf_contains_word "${words[c]}" "${must_have_one_noun[@]}"; then
+        must_have_one_noun=()
+    elif __buf_contains_word "${words[c]}" "${noun_aliases[@]}"; then
+        must_have_one_noun=()
+    fi
+
+    nouns+=("${words[c]}")
+    c=$((c+1))
+}
+
+__buf_handle_command()
+{
+    __buf_debug "${FUNCNAME[0]}: c is $c words[c] is ${words[c]}"
+
+    local next_command
+    if [[ -n ${last_command} ]]; then
+        next_command="_${last_command}_${words[c]//:/__}"
+    else
+        if [[ $c -eq 0 ]]; then
+            next_command="_buf_root_command"
+        else
+            next_command="_${words[c]//:/__}"
+        fi
+    fi
+    c=$((c+1))
+    __buf_debug "${FUNCNAME[0]}: looking for ${next_command}"
+    declare -F "$next_command" >/dev/null && $next_command
+}
+
+__buf_handle_word()
+{
+    if [[ $c -ge $cword ]]; then
+        __buf_handle_reply
+        return
+    fi
+    __buf_debug "${FUNCNAME[0]}: c is $c words[c] is ${words[c]}"
+    if [[ "${words[c]}" == -* ]]; then
+        __buf_handle_flag
+    elif __buf_contains_word "${words[c]}" "${commands[@]}"; then
+        __buf_handle_command
+    elif [[ $c -eq 0 ]]; then
+        __buf_handle_command
+    elif __buf_contains_word "${words[c]}" "${command_aliases[@]}"; then
+        # aliashash variable is an associative array which is only supported in bash > 3.
+        if [[ -z "${BASH_VERSION:-}" || "${BASH_VERSINFO[0]:-}" -gt 3 ]]; then
+            words[c]=${aliashash[${words[c]}]}
+            __buf_handle_command
+        else
+            __buf_handle_noun
+        fi
+    else
+        __buf_handle_noun
+    fi
+    __buf_handle_word
+}
+
+_buf_beta_buf-plugin-v1()
+{
+    last_command="buf_beta_buf-plugin-v1"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--protocol")
+    local_nonpersistent_flags+=("--protocol")
+    flags+=("--spec")
+    local_nonpersistent_flags+=("--spec")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_buf-plugin-v1beta1()
+{
+    last_command="buf_beta_buf-plugin-v1beta1"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--protocol")
+    local_nonpersistent_flags+=("--protocol")
+    flags+=("--spec")
+    local_nonpersistent_flags+=("--spec")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_buf-plugin-v2()
+{
+    last_command="buf_beta_buf-plugin-v2"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--protocol")
+    local_nonpersistent_flags+=("--protocol")
+    flags+=("--spec")
+    local_nonpersistent_flags+=("--spec")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_price()
+{
+    last_command="buf_beta_price"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry_plugin_delete()
+{
+    last_command="buf_beta_registry_plugin_delete"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--force")
+    local_nonpersistent_flags+=("--force")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry_plugin_push()
+{
+    last_command="buf_beta_registry_plugin_push"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--image=")
+    two_word_flags+=("--image")
+    local_nonpersistent_flags+=("--image")
+    local_nonpersistent_flags+=("--image=")
+    flags+=("--override-remote=")
+    two_word_flags+=("--override-remote")
+    local_nonpersistent_flags+=("--override-remote")
+    local_nonpersistent_flags+=("--override-remote=")
+    flags+=("--visibility=")
+    two_word_flags+=("--visibility")
+    flags_with_completion+=("--visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--visibility")
+    local_nonpersistent_flags+=("--visibility=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--visibility=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry_plugin()
+{
+    last_command="buf_beta_registry_plugin"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("delete")
+    commands+=("push")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry_webhook_create()
+{
+    last_command="buf_beta_registry_webhook_create"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--callback-url=")
+    two_word_flags+=("--callback-url")
+    local_nonpersistent_flags+=("--callback-url")
+    local_nonpersistent_flags+=("--callback-url=")
+    flags+=("--event=")
+    two_word_flags+=("--event")
+    local_nonpersistent_flags+=("--event")
+    local_nonpersistent_flags+=("--event=")
+    flags+=("--owner=")
+    two_word_flags+=("--owner")
+    local_nonpersistent_flags+=("--owner")
+    local_nonpersistent_flags+=("--owner=")
+    flags+=("--remote=")
+    two_word_flags+=("--remote")
+    local_nonpersistent_flags+=("--remote")
+    local_nonpersistent_flags+=("--remote=")
+    flags+=("--repository=")
+    two_word_flags+=("--repository")
+    local_nonpersistent_flags+=("--repository")
+    local_nonpersistent_flags+=("--repository=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--callback-url=")
+    must_have_one_flag+=("--event=")
+    must_have_one_flag+=("--owner=")
+    must_have_one_flag+=("--remote=")
+    must_have_one_flag+=("--repository=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry_webhook_delete()
+{
+    last_command="buf_beta_registry_webhook_delete"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--id=")
+    two_word_flags+=("--id")
+    local_nonpersistent_flags+=("--id")
+    local_nonpersistent_flags+=("--id=")
+    flags+=("--remote=")
+    two_word_flags+=("--remote")
+    local_nonpersistent_flags+=("--remote")
+    local_nonpersistent_flags+=("--remote=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--id=")
+    must_have_one_flag+=("--remote=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry_webhook_list()
+{
+    last_command="buf_beta_registry_webhook_list"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--owner=")
+    two_word_flags+=("--owner")
+    local_nonpersistent_flags+=("--owner")
+    local_nonpersistent_flags+=("--owner=")
+    flags+=("--remote=")
+    two_word_flags+=("--remote")
+    local_nonpersistent_flags+=("--remote")
+    local_nonpersistent_flags+=("--remote=")
+    flags+=("--repository=")
+    two_word_flags+=("--repository")
+    local_nonpersistent_flags+=("--repository")
+    local_nonpersistent_flags+=("--repository=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--owner=")
+    must_have_one_flag+=("--remote=")
+    must_have_one_flag+=("--repository=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry_webhook()
+{
+    last_command="buf_beta_registry_webhook"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("create")
+    commands+=("delete")
+    commands+=("list")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_registry()
+{
+    last_command="buf_beta_registry"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("plugin")
+    commands+=("webhook")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta_studio-agent()
+{
+    last_command="buf_beta_studio-agent"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--bind=")
+    two_word_flags+=("--bind")
+    local_nonpersistent_flags+=("--bind")
+    local_nonpersistent_flags+=("--bind=")
+    flags+=("--ca-cert=")
+    two_word_flags+=("--ca-cert")
+    local_nonpersistent_flags+=("--ca-cert")
+    local_nonpersistent_flags+=("--ca-cert=")
+    flags+=("--client-cert=")
+    two_word_flags+=("--client-cert")
+    local_nonpersistent_flags+=("--client-cert")
+    local_nonpersistent_flags+=("--client-cert=")
+    flags+=("--client-key=")
+    two_word_flags+=("--client-key")
+    local_nonpersistent_flags+=("--client-key")
+    local_nonpersistent_flags+=("--client-key=")
+    flags+=("--disallowed-header=")
+    two_word_flags+=("--disallowed-header")
+    local_nonpersistent_flags+=("--disallowed-header")
+    local_nonpersistent_flags+=("--disallowed-header=")
+    flags+=("--forward-header=")
+    two_word_flags+=("--forward-header")
+    local_nonpersistent_flags+=("--forward-header")
+    local_nonpersistent_flags+=("--forward-header=")
+    flags+=("--origin=")
+    two_word_flags+=("--origin")
+    local_nonpersistent_flags+=("--origin")
+    local_nonpersistent_flags+=("--origin=")
+    flags+=("--port=")
+    two_word_flags+=("--port")
+    local_nonpersistent_flags+=("--port")
+    local_nonpersistent_flags+=("--port=")
+    flags+=("--private-network")
+    local_nonpersistent_flags+=("--private-network")
+    flags+=("--server-cert=")
+    two_word_flags+=("--server-cert")
+    local_nonpersistent_flags+=("--server-cert")
+    local_nonpersistent_flags+=("--server-cert=")
+    flags+=("--server-key=")
+    two_word_flags+=("--server-key")
+    local_nonpersistent_flags+=("--server-key")
+    local_nonpersistent_flags+=("--server-key=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_beta()
+{
+    last_command="buf_beta"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("buf-plugin-v1")
+    commands+=("buf-plugin-v1beta1")
+    commands+=("buf-plugin-v2")
+    commands+=("price")
+    commands+=("registry")
+    commands+=("studio-agent")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_breaking()
+{
+    last_command="buf_breaking"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--against=")
+    two_word_flags+=("--against")
+    local_nonpersistent_flags+=("--against")
+    local_nonpersistent_flags+=("--against=")
+    flags+=("--against-config=")
+    two_word_flags+=("--against-config")
+    local_nonpersistent_flags+=("--against-config")
+    local_nonpersistent_flags+=("--against-config=")
+    flags+=("--against-registry")
+    local_nonpersistent_flags+=("--against-registry")
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--exclude-imports")
+    local_nonpersistent_flags+=("--exclude-imports")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--limit-to-input-files")
+    local_nonpersistent_flags+=("--limit-to-input-files")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_build()
+{
+    last_command="buf_build"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--as-file-descriptor-set")
+    local_nonpersistent_flags+=("--as-file-descriptor-set")
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--exclude-imports")
+    local_nonpersistent_flags+=("--exclude-imports")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--exclude-source-info")
+    local_nonpersistent_flags+=("--exclude-source-info")
+    flags+=("--exclude-source-retention-options")
+    local_nonpersistent_flags+=("--exclude-source-retention-options")
+    flags+=("--output=")
+    two_word_flags+=("--output")
+    two_word_flags+=("-o")
+    local_nonpersistent_flags+=("--output")
+    local_nonpersistent_flags+=("--output=")
+    local_nonpersistent_flags+=("-o")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--type=")
+    two_word_flags+=("--type")
+    local_nonpersistent_flags+=("--type")
+    local_nonpersistent_flags+=("--type=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_completion_bash()
+{
+    last_command="buf_completion_bash"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help")
+    flags+=("-h")
+    local_nonpersistent_flags+=("--help")
+    local_nonpersistent_flags+=("-h")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_completion_fish()
+{
+    last_command="buf_completion_fish"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_completion_powershell()
+{
+    last_command="buf_completion_powershell"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_completion_zsh()
+{
+    last_command="buf_completion_zsh"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_completion()
+{
+    last_command="buf_completion"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("bash")
+    commands+=("fish")
+    commands+=("powershell")
+    commands+=("zsh")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_config_init()
+{
+    last_command="buf_config_init"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--output=")
+    two_word_flags+=("--output")
+    two_word_flags+=("-o")
+    local_nonpersistent_flags+=("--output")
+    local_nonpersistent_flags+=("--output=")
+    local_nonpersistent_flags+=("-o")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_config_ls-breaking-rules()
+{
+    last_command="buf_config_ls-breaking-rules"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--configured-only")
+    local_nonpersistent_flags+=("--configured-only")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--include-deprecated")
+    local_nonpersistent_flags+=("--include-deprecated")
+    flags+=("--module-path=")
+    two_word_flags+=("--module-path")
+    local_nonpersistent_flags+=("--module-path")
+    local_nonpersistent_flags+=("--module-path=")
+    flags+=("--version=")
+    two_word_flags+=("--version")
+    flags_with_completion+=("--version")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--version")
+    local_nonpersistent_flags+=("--version=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_config_ls-lint-rules()
+{
+    last_command="buf_config_ls-lint-rules"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--configured-only")
+    local_nonpersistent_flags+=("--configured-only")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--include-deprecated")
+    local_nonpersistent_flags+=("--include-deprecated")
+    flags+=("--module-path=")
+    two_word_flags+=("--module-path")
+    local_nonpersistent_flags+=("--module-path")
+    local_nonpersistent_flags+=("--module-path=")
+    flags+=("--version=")
+    two_word_flags+=("--version")
+    flags_with_completion+=("--version")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--version")
+    local_nonpersistent_flags+=("--version=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_config_ls-modules()
+{
+    last_command="buf_config_ls-modules"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_config_migrate()
+{
+    last_command="buf_config_migrate"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--buf-gen-yaml=")
+    two_word_flags+=("--buf-gen-yaml")
+    local_nonpersistent_flags+=("--buf-gen-yaml")
+    local_nonpersistent_flags+=("--buf-gen-yaml=")
+    flags+=("--diff")
+    flags+=("-d")
+    local_nonpersistent_flags+=("--diff")
+    local_nonpersistent_flags+=("-d")
+    flags+=("--module=")
+    two_word_flags+=("--module")
+    local_nonpersistent_flags+=("--module")
+    local_nonpersistent_flags+=("--module=")
+    flags+=("--workspace=")
+    two_word_flags+=("--workspace")
+    local_nonpersistent_flags+=("--workspace")
+    local_nonpersistent_flags+=("--workspace=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_config()
+{
+    last_command="buf_config"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("init")
+    commands+=("ls-breaking-rules")
+    commands+=("ls-lint-rules")
+    commands+=("ls-modules")
+    commands+=("migrate")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_convert()
+{
+    last_command="buf_convert"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--from=")
+    two_word_flags+=("--from")
+    local_nonpersistent_flags+=("--from")
+    local_nonpersistent_flags+=("--from=")
+    flags+=("--to=")
+    two_word_flags+=("--to")
+    local_nonpersistent_flags+=("--to")
+    local_nonpersistent_flags+=("--to=")
+    flags+=("--type=")
+    two_word_flags+=("--type")
+    local_nonpersistent_flags+=("--type")
+    local_nonpersistent_flags+=("--type=")
+    flags+=("--validate")
+    local_nonpersistent_flags+=("--validate")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_curl()
+{
+    last_command="buf_curl"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--cacert=")
+    two_word_flags+=("--cacert")
+    local_nonpersistent_flags+=("--cacert")
+    local_nonpersistent_flags+=("--cacert=")
+    flags+=("--cert=")
+    two_word_flags+=("--cert")
+    two_word_flags+=("-E")
+    local_nonpersistent_flags+=("--cert")
+    local_nonpersistent_flags+=("--cert=")
+    local_nonpersistent_flags+=("-E")
+    flags+=("--connect-timeout=")
+    two_word_flags+=("--connect-timeout")
+    local_nonpersistent_flags+=("--connect-timeout")
+    local_nonpersistent_flags+=("--connect-timeout=")
+    flags+=("--data=")
+    two_word_flags+=("--data")
+    two_word_flags+=("-d")
+    local_nonpersistent_flags+=("--data")
+    local_nonpersistent_flags+=("--data=")
+    local_nonpersistent_flags+=("-d")
+    flags+=("--emit-defaults")
+    local_nonpersistent_flags+=("--emit-defaults")
+    flags+=("--header=")
+    two_word_flags+=("--header")
+    flags_with_completion+=("--header")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    two_word_flags+=("-H")
+    flags_with_completion+=("-H")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--header")
+    local_nonpersistent_flags+=("--header=")
+    local_nonpersistent_flags+=("-H")
+    flags+=("--http2-prior-knowledge")
+    local_nonpersistent_flags+=("--http2-prior-knowledge")
+    flags+=("--http3")
+    local_nonpersistent_flags+=("--http3")
+    flags+=("--insecure")
+    flags+=("-k")
+    local_nonpersistent_flags+=("--insecure")
+    local_nonpersistent_flags+=("-k")
+    flags+=("--keepalive-time=")
+    two_word_flags+=("--keepalive-time")
+    local_nonpersistent_flags+=("--keepalive-time")
+    local_nonpersistent_flags+=("--keepalive-time=")
+    flags+=("--key=")
+    two_word_flags+=("--key")
+    local_nonpersistent_flags+=("--key")
+    local_nonpersistent_flags+=("--key=")
+    flags+=("--list-methods")
+    local_nonpersistent_flags+=("--list-methods")
+    flags+=("--list-services")
+    local_nonpersistent_flags+=("--list-services")
+    flags+=("--netrc")
+    flags+=("-n")
+    local_nonpersistent_flags+=("--netrc")
+    local_nonpersistent_flags+=("-n")
+    flags+=("--netrc-file=")
+    two_word_flags+=("--netrc-file")
+    local_nonpersistent_flags+=("--netrc-file")
+    local_nonpersistent_flags+=("--netrc-file=")
+    flags+=("--no-keepalive")
+    local_nonpersistent_flags+=("--no-keepalive")
+    flags+=("--output=")
+    two_word_flags+=("--output")
+    two_word_flags+=("-o")
+    local_nonpersistent_flags+=("--output")
+    local_nonpersistent_flags+=("--output=")
+    local_nonpersistent_flags+=("-o")
+    flags+=("--protocol=")
+    two_word_flags+=("--protocol")
+    flags_with_completion+=("--protocol")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--protocol")
+    local_nonpersistent_flags+=("--protocol=")
+    flags+=("--reflect")
+    local_nonpersistent_flags+=("--reflect")
+    flags+=("--reflect-header=")
+    two_word_flags+=("--reflect-header")
+    flags_with_completion+=("--reflect-header")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--reflect-header")
+    local_nonpersistent_flags+=("--reflect-header=")
+    flags+=("--reflect-protocol=")
+    two_word_flags+=("--reflect-protocol")
+    flags_with_completion+=("--reflect-protocol")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--reflect-protocol")
+    local_nonpersistent_flags+=("--reflect-protocol=")
+    flags+=("--schema=")
+    two_word_flags+=("--schema")
+    local_nonpersistent_flags+=("--schema")
+    local_nonpersistent_flags+=("--schema=")
+    flags+=("--servername=")
+    two_word_flags+=("--servername")
+    local_nonpersistent_flags+=("--servername")
+    local_nonpersistent_flags+=("--servername=")
+    flags+=("--unix-socket=")
+    two_word_flags+=("--unix-socket")
+    local_nonpersistent_flags+=("--unix-socket")
+    local_nonpersistent_flags+=("--unix-socket=")
+    flags+=("--user=")
+    two_word_flags+=("--user")
+    two_word_flags+=("-u")
+    local_nonpersistent_flags+=("--user")
+    local_nonpersistent_flags+=("--user=")
+    local_nonpersistent_flags+=("-u")
+    flags+=("--user-agent=")
+    two_word_flags+=("--user-agent")
+    two_word_flags+=("-A")
+    local_nonpersistent_flags+=("--user-agent")
+    local_nonpersistent_flags+=("--user-agent=")
+    local_nonpersistent_flags+=("-A")
+    flags+=("--verbose")
+    flags+=("-v")
+    local_nonpersistent_flags+=("--verbose")
+    local_nonpersistent_flags+=("-v")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    has_completion_function=1
+    noun_aliases=()
+}
+
+_buf_dep_graph()
+{
+    last_command="buf_dep_graph"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_dep_prune()
+{
+    last_command="buf_dep_prune"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_dep_update()
+{
+    last_command="buf_dep_update"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_dep()
+{
+    last_command="buf_dep"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("graph")
+    commands+=("prune")
+    commands+=("update")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_export()
+{
+    last_command="buf_export"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--all")
+    local_nonpersistent_flags+=("--all")
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--exclude-imports")
+    local_nonpersistent_flags+=("--exclude-imports")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--output=")
+    two_word_flags+=("--output")
+    flags_with_completion+=("--output")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    two_word_flags+=("-o")
+    flags_with_completion+=("-o")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--output")
+    local_nonpersistent_flags+=("--output=")
+    local_nonpersistent_flags+=("-o")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--output=")
+    must_have_one_flag+=("-o")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_format()
+{
+    last_command="buf_format"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--diff")
+    flags+=("-d")
+    local_nonpersistent_flags+=("--diff")
+    local_nonpersistent_flags+=("-d")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--exit-code")
+    local_nonpersistent_flags+=("--exit-code")
+    flags+=("--output=")
+    two_word_flags+=("--output")
+    two_word_flags+=("-o")
+    local_nonpersistent_flags+=("--output")
+    local_nonpersistent_flags+=("--output=")
+    local_nonpersistent_flags+=("-o")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--write")
+    flags+=("-w")
+    local_nonpersistent_flags+=("--write")
+    local_nonpersistent_flags+=("-w")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_generate()
+{
+    last_command="buf_generate"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--clean")
+    local_nonpersistent_flags+=("--clean")
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--exclude-type=")
+    two_word_flags+=("--exclude-type")
+    flags_with_completion+=("--exclude-type")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--exclude-type")
+    local_nonpersistent_flags+=("--exclude-type=")
+    flags+=("--include-imports")
+    local_nonpersistent_flags+=("--include-imports")
+    flags+=("--include-wkt")
+    local_nonpersistent_flags+=("--include-wkt")
+    flags+=("--output=")
+    two_word_flags+=("--output")
+    flags_with_completion+=("--output")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    two_word_flags+=("-o")
+    flags_with_completion+=("-o")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--output")
+    local_nonpersistent_flags+=("--output=")
+    local_nonpersistent_flags+=("-o")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--template=")
+    two_word_flags+=("--template")
+    flags_with_completion+=("--template")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--template")
+    local_nonpersistent_flags+=("--template=")
+    flags+=("--type=")
+    two_word_flags+=("--type")
+    flags_with_completion+=("--type")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--type")
+    local_nonpersistent_flags+=("--type=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_help()
+{
+    last_command="buf_help"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    has_completion_function=1
+    noun_aliases=()
+}
+
+_buf_lint()
+{
+    last_command="buf_lint"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_ls-files()
+{
+    last_command="buf_ls-files"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--include-importable")
+    local_nonpersistent_flags+=("--include-importable")
+    flags+=("--include-imports")
+    local_nonpersistent_flags+=("--include-imports")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_lsp_serve()
+{
+    last_command="buf_lsp_serve"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug-address=")
+    two_word_flags+=("--debug-address")
+    local_nonpersistent_flags+=("--debug-address")
+    local_nonpersistent_flags+=("--debug-address=")
+    flags+=("--pipe=")
+    two_word_flags+=("--pipe")
+    local_nonpersistent_flags+=("--pipe")
+    local_nonpersistent_flags+=("--pipe=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_lsp()
+{
+    last_command="buf_lsp"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("serve")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_plugin_prune()
+{
+    last_command="buf_plugin_prune"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_plugin_push()
+{
+    last_command="buf_plugin_push"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--binary=")
+    two_word_flags+=("--binary")
+    flags_with_completion+=("--binary")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--binary")
+    local_nonpersistent_flags+=("--binary=")
+    flags+=("--create")
+    local_nonpersistent_flags+=("--create")
+    flags+=("--create-type=")
+    two_word_flags+=("--create-type")
+    flags_with_completion+=("--create-type")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--create-type")
+    local_nonpersistent_flags+=("--create-type=")
+    flags+=("--create-visibility=")
+    two_word_flags+=("--create-visibility")
+    flags_with_completion+=("--create-visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--create-visibility")
+    local_nonpersistent_flags+=("--create-visibility=")
+    flags+=("--label=")
+    two_word_flags+=("--label")
+    flags_with_completion+=("--label")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--label")
+    local_nonpersistent_flags+=("--label=")
+    flags+=("--source-control-url=")
+    two_word_flags+=("--source-control-url")
+    flags_with_completion+=("--source-control-url")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--source-control-url")
+    local_nonpersistent_flags+=("--source-control-url=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_plugin_update()
+{
+    last_command="buf_plugin_update"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_plugin()
+{
+    last_command="buf_plugin"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("prune")
+    commands+=("push")
+    commands+=("update")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_push()
+{
+    last_command="buf_push"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--create")
+    local_nonpersistent_flags+=("--create")
+    flags+=("--create-default-label=")
+    two_word_flags+=("--create-default-label")
+    local_nonpersistent_flags+=("--create-default-label")
+    local_nonpersistent_flags+=("--create-default-label=")
+    flags+=("--create-visibility=")
+    two_word_flags+=("--create-visibility")
+    local_nonpersistent_flags+=("--create-visibility")
+    local_nonpersistent_flags+=("--create-visibility=")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--exclude-unnamed")
+    local_nonpersistent_flags+=("--exclude-unnamed")
+    flags+=("--git-metadata")
+    local_nonpersistent_flags+=("--git-metadata")
+    flags+=("--label=")
+    two_word_flags+=("--label")
+    flags_with_completion+=("--label")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--label")
+    local_nonpersistent_flags+=("--label=")
+    flags+=("--source-control-url=")
+    two_word_flags+=("--source-control-url")
+    flags_with_completion+=("--source-control-url")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--source-control-url")
+    local_nonpersistent_flags+=("--source-control-url=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_cc()
+{
+    last_command="buf_registry_cc"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_login()
+{
+    last_command="buf_registry_login"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--prompt")
+    local_nonpersistent_flags+=("--prompt")
+    flags+=("--token-stdin")
+    local_nonpersistent_flags+=("--token-stdin")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_logout()
+{
+    last_command="buf_registry_logout"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_commit_add-label()
+{
+    last_command="buf_registry_module_commit_add-label"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--label=")
+    two_word_flags+=("--label")
+    local_nonpersistent_flags+=("--label")
+    local_nonpersistent_flags+=("--label=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_commit_info()
+{
+    last_command="buf_registry_module_commit_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_commit_list()
+{
+    last_command="buf_registry_module_commit_list"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--digest-changes-only")
+    local_nonpersistent_flags+=("--digest-changes-only")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--page-size=")
+    two_word_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size=")
+    flags+=("--page-token=")
+    two_word_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token=")
+    flags+=("--reverse")
+    local_nonpersistent_flags+=("--reverse")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_commit_resolve()
+{
+    last_command="buf_registry_module_commit_resolve"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_commit()
+{
+    last_command="buf_registry_module_commit"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("add-label")
+    commands+=("info")
+    commands+=("list")
+    commands+=("resolve")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_create()
+{
+    last_command="buf_registry_module_create"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--default-label-name=")
+    two_word_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--visibility=")
+    two_word_flags+=("--visibility")
+    flags_with_completion+=("--visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--visibility")
+    local_nonpersistent_flags+=("--visibility=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_delete()
+{
+    last_command="buf_registry_module_delete"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--force")
+    local_nonpersistent_flags+=("--force")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_deprecate()
+{
+    last_command="buf_registry_module_deprecate"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_info()
+{
+    last_command="buf_registry_module_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_label_archive()
+{
+    last_command="buf_registry_module_label_archive"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_label_info()
+{
+    last_command="buf_registry_module_label_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_label_list()
+{
+    last_command="buf_registry_module_label_list"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--archive-status=")
+    two_word_flags+=("--archive-status")
+    local_nonpersistent_flags+=("--archive-status")
+    local_nonpersistent_flags+=("--archive-status=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--page-size=")
+    two_word_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size=")
+    flags+=("--page-token=")
+    two_word_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token=")
+    flags+=("--reverse")
+    local_nonpersistent_flags+=("--reverse")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_label_unarchive()
+{
+    last_command="buf_registry_module_label_unarchive"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_label()
+{
+    last_command="buf_registry_module_label"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("archive")
+    commands+=("info")
+    commands+=("list")
+    commands+=("unarchive")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_settings_update()
+{
+    last_command="buf_registry_module_settings_update"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--default-label-name=")
+    two_word_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name=")
+    flags+=("--description=")
+    two_word_flags+=("--description")
+    local_nonpersistent_flags+=("--description")
+    local_nonpersistent_flags+=("--description=")
+    flags+=("--url=")
+    two_word_flags+=("--url")
+    local_nonpersistent_flags+=("--url")
+    local_nonpersistent_flags+=("--url=")
+    flags+=("--visibility=")
+    two_word_flags+=("--visibility")
+    flags_with_completion+=("--visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--visibility")
+    local_nonpersistent_flags+=("--visibility=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_settings()
+{
+    last_command="buf_registry_module_settings"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("update")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module_undeprecate()
+{
+    last_command="buf_registry_module_undeprecate"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_module()
+{
+    last_command="buf_registry_module"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("commit")
+    commands+=("create")
+    commands+=("delete")
+    commands+=("deprecate")
+    commands+=("info")
+    commands+=("label")
+    commands+=("settings")
+    commands+=("undeprecate")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_organization_create()
+{
+    last_command="buf_registry_organization_create"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_organization_delete()
+{
+    last_command="buf_registry_organization_delete"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--force")
+    local_nonpersistent_flags+=("--force")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_organization_info()
+{
+    last_command="buf_registry_organization_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_organization_update()
+{
+    last_command="buf_registry_organization_update"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--description=")
+    two_word_flags+=("--description")
+    local_nonpersistent_flags+=("--description")
+    local_nonpersistent_flags+=("--description=")
+    flags+=("--url=")
+    two_word_flags+=("--url")
+    local_nonpersistent_flags+=("--url")
+    local_nonpersistent_flags+=("--url=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_organization()
+{
+    last_command="buf_registry_organization"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("create")
+    commands+=("delete")
+    commands+=("info")
+    commands+=("update")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_commit_add-label()
+{
+    last_command="buf_registry_plugin_commit_add-label"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--label=")
+    two_word_flags+=("--label")
+    local_nonpersistent_flags+=("--label")
+    local_nonpersistent_flags+=("--label=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_commit_info()
+{
+    last_command="buf_registry_plugin_commit_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_commit_list()
+{
+    last_command="buf_registry_plugin_commit_list"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--digest-changes-only")
+    local_nonpersistent_flags+=("--digest-changes-only")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--page-size=")
+    two_word_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size=")
+    flags+=("--page-token=")
+    two_word_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token=")
+    flags+=("--reverse")
+    local_nonpersistent_flags+=("--reverse")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_commit_resolve()
+{
+    last_command="buf_registry_plugin_commit_resolve"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_commit()
+{
+    last_command="buf_registry_plugin_commit"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("add-label")
+    commands+=("info")
+    commands+=("list")
+    commands+=("resolve")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_create()
+{
+    last_command="buf_registry_plugin_create"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--default-label-name=")
+    two_word_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--type=")
+    two_word_flags+=("--type")
+    flags_with_completion+=("--type")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--type")
+    local_nonpersistent_flags+=("--type=")
+    flags+=("--visibility=")
+    two_word_flags+=("--visibility")
+    flags_with_completion+=("--visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--visibility")
+    local_nonpersistent_flags+=("--visibility=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--type=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_delete()
+{
+    last_command="buf_registry_plugin_delete"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--force")
+    local_nonpersistent_flags+=("--force")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_info()
+{
+    last_command="buf_registry_plugin_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_label_archive()
+{
+    last_command="buf_registry_plugin_label_archive"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_label_info()
+{
+    last_command="buf_registry_plugin_label_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_label_list()
+{
+    last_command="buf_registry_plugin_label_list"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--archive-status=")
+    two_word_flags+=("--archive-status")
+    local_nonpersistent_flags+=("--archive-status")
+    local_nonpersistent_flags+=("--archive-status=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--page-size=")
+    two_word_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size=")
+    flags+=("--page-token=")
+    two_word_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token=")
+    flags+=("--reverse")
+    local_nonpersistent_flags+=("--reverse")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_label_unarchive()
+{
+    last_command="buf_registry_plugin_label_unarchive"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_label()
+{
+    last_command="buf_registry_plugin_label"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("archive")
+    commands+=("info")
+    commands+=("list")
+    commands+=("unarchive")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_settings_update()
+{
+    last_command="buf_registry_plugin_settings_update"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--description=")
+    two_word_flags+=("--description")
+    local_nonpersistent_flags+=("--description")
+    local_nonpersistent_flags+=("--description=")
+    flags+=("--url=")
+    two_word_flags+=("--url")
+    local_nonpersistent_flags+=("--url")
+    local_nonpersistent_flags+=("--url=")
+    flags+=("--visibility=")
+    two_word_flags+=("--visibility")
+    flags_with_completion+=("--visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--visibility")
+    local_nonpersistent_flags+=("--visibility=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin_settings()
+{
+    last_command="buf_registry_plugin_settings"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("update")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_plugin()
+{
+    last_command="buf_registry_plugin"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("commit")
+    commands+=("create")
+    commands+=("delete")
+    commands+=("info")
+    commands+=("label")
+    commands+=("settings")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_commit_add-label()
+{
+    last_command="buf_registry_policy_commit_add-label"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--label=")
+    two_word_flags+=("--label")
+    local_nonpersistent_flags+=("--label")
+    local_nonpersistent_flags+=("--label=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_commit_info()
+{
+    last_command="buf_registry_policy_commit_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_commit_list()
+{
+    last_command="buf_registry_policy_commit_list"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--page-size=")
+    two_word_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size=")
+    flags+=("--page-token=")
+    two_word_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token=")
+    flags+=("--reverse")
+    local_nonpersistent_flags+=("--reverse")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_commit_resolve()
+{
+    last_command="buf_registry_policy_commit_resolve"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_commit()
+{
+    last_command="buf_registry_policy_commit"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("add-label")
+    commands+=("info")
+    commands+=("list")
+    commands+=("resolve")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_create()
+{
+    last_command="buf_registry_policy_create"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--default-label-name=")
+    two_word_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name")
+    local_nonpersistent_flags+=("--default-label-name=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--visibility=")
+    two_word_flags+=("--visibility")
+    flags_with_completion+=("--visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--visibility")
+    local_nonpersistent_flags+=("--visibility=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_delete()
+{
+    last_command="buf_registry_policy_delete"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--force")
+    local_nonpersistent_flags+=("--force")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_info()
+{
+    last_command="buf_registry_policy_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_label_archive()
+{
+    last_command="buf_registry_policy_label_archive"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_label_info()
+{
+    last_command="buf_registry_policy_label_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_label_list()
+{
+    last_command="buf_registry_policy_label_list"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--archive-status=")
+    two_word_flags+=("--archive-status")
+    local_nonpersistent_flags+=("--archive-status")
+    local_nonpersistent_flags+=("--archive-status=")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--page-size=")
+    two_word_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size")
+    local_nonpersistent_flags+=("--page-size=")
+    flags+=("--page-token=")
+    two_word_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token")
+    local_nonpersistent_flags+=("--page-token=")
+    flags+=("--reverse")
+    local_nonpersistent_flags+=("--reverse")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_label_unarchive()
+{
+    last_command="buf_registry_policy_label_unarchive"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_label()
+{
+    last_command="buf_registry_policy_label"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("archive")
+    commands+=("info")
+    commands+=("list")
+    commands+=("unarchive")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_settings_update()
+{
+    last_command="buf_registry_policy_settings_update"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--description=")
+    two_word_flags+=("--description")
+    local_nonpersistent_flags+=("--description")
+    local_nonpersistent_flags+=("--description=")
+    flags+=("--url=")
+    two_word_flags+=("--url")
+    local_nonpersistent_flags+=("--url")
+    local_nonpersistent_flags+=("--url=")
+    flags+=("--visibility=")
+    two_word_flags+=("--visibility")
+    flags_with_completion+=("--visibility")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--visibility")
+    local_nonpersistent_flags+=("--visibility=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy_settings()
+{
+    last_command="buf_registry_policy_settings"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("update")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_policy()
+{
+    last_command="buf_registry_policy"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("commit")
+    commands+=("create")
+    commands+=("delete")
+    commands+=("info")
+    commands+=("label")
+    commands+=("settings")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_sdk_info()
+{
+    last_command="buf_registry_sdk_info"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--module=")
+    two_word_flags+=("--module")
+    local_nonpersistent_flags+=("--module")
+    local_nonpersistent_flags+=("--module=")
+    flags+=("--plugin=")
+    two_word_flags+=("--plugin")
+    local_nonpersistent_flags+=("--plugin")
+    local_nonpersistent_flags+=("--plugin=")
+    flags+=("--version=")
+    two_word_flags+=("--version")
+    local_nonpersistent_flags+=("--version")
+    local_nonpersistent_flags+=("--version=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--module=")
+    must_have_one_flag+=("--plugin=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_sdk_version()
+{
+    last_command="buf_registry_sdk_version"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--module=")
+    two_word_flags+=("--module")
+    local_nonpersistent_flags+=("--module")
+    local_nonpersistent_flags+=("--module=")
+    flags+=("--plugin=")
+    two_word_flags+=("--plugin")
+    local_nonpersistent_flags+=("--plugin")
+    local_nonpersistent_flags+=("--plugin=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--module=")
+    must_have_one_flag+=("--plugin=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_sdk()
+{
+    last_command="buf_registry_sdk"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("info")
+    commands+=("version")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry_whoami()
+{
+    last_command="buf_registry_whoami"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_registry()
+{
+    last_command="buf_registry"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("cc")
+    commands+=("login")
+    commands+=("logout")
+    commands+=("module")
+    commands+=("organization")
+    commands+=("plugin")
+    commands+=("policy")
+    commands+=("sdk")
+    commands+=("whoami")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_source_edit_deprecate()
+{
+    last_command="buf_source_edit_deprecate"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--config=")
+    two_word_flags+=("--config")
+    local_nonpersistent_flags+=("--config")
+    local_nonpersistent_flags+=("--config=")
+    flags+=("--diff")
+    flags+=("-d")
+    local_nonpersistent_flags+=("--diff")
+    local_nonpersistent_flags+=("-d")
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--error-format=")
+    two_word_flags+=("--error-format")
+    flags_with_completion+=("--error-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--error-format")
+    local_nonpersistent_flags+=("--error-format=")
+    flags+=("--exclude-path=")
+    two_word_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path")
+    local_nonpersistent_flags+=("--exclude-path=")
+    flags+=("--path=")
+    two_word_flags+=("--path")
+    local_nonpersistent_flags+=("--path")
+    local_nonpersistent_flags+=("--path=")
+    flags+=("--prefix=")
+    two_word_flags+=("--prefix")
+    local_nonpersistent_flags+=("--prefix")
+    local_nonpersistent_flags+=("--prefix=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_flag+=("--prefix=")
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_source_edit()
+{
+    last_command="buf_source_edit"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("deprecate")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_source()
+{
+    last_command="buf_source"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("edit")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_stats()
+{
+    last_command="buf_stats"
+
+    command_aliases=()
+
+    commands=()
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--disable-symlinks")
+    local_nonpersistent_flags+=("--disable-symlinks")
+    flags+=("--format=")
+    two_word_flags+=("--format")
+    flags_with_completion+=("--format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    local_nonpersistent_flags+=("--format")
+    local_nonpersistent_flags+=("--format=")
+    flags+=("--debug")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+_buf_root_command()
+{
+    last_command="buf"
+
+    command_aliases=()
+
+    commands=()
+    commands+=("beta")
+    commands+=("breaking")
+    commands+=("build")
+    commands+=("completion")
+    commands+=("config")
+    commands+=("convert")
+    commands+=("curl")
+    commands+=("dep")
+    commands+=("export")
+    commands+=("format")
+    commands+=("generate")
+    commands+=("help")
+    commands+=("lint")
+    commands+=("ls-files")
+    commands+=("lsp")
+    commands+=("plugin")
+    commands+=("push")
+    commands+=("registry")
+    commands+=("source")
+    commands+=("stats")
+
+    flags=()
+    two_word_flags=()
+    local_nonpersistent_flags=()
+    flags_with_completion=()
+    flags_completion=()
+
+    flags+=("--debug")
+    flags+=("--help-tree")
+    local_nonpersistent_flags+=("--help-tree")
+    flags+=("--log-format=")
+    two_word_flags+=("--log-format")
+    flags_with_completion+=("--log-format")
+    flags_completion+=("__buf_handle_go_custom_completion")
+    flags+=("--timeout=")
+    two_word_flags+=("--timeout")
+    flags+=("--version")
+    local_nonpersistent_flags+=("--version")
+
+    must_have_one_flag=()
+    must_have_one_noun=()
+    noun_aliases=()
+}
+
+__start_buf()
+{
+    local cur prev words cword split
+    declare -A flaghash 2>/dev/null || :
+    declare -A aliashash 2>/dev/null || :
+    if declare -F _init_completion >/dev/null 2>&1; then
+        _init_completion -s || return
+    else
+        __buf_init_completion -n "=" || return
+    fi
+
+    local c=0
+    local flag_parsing_disabled=
+    local flags=()
+    local two_word_flags=()
+    local local_nonpersistent_flags=()
+    local flags_with_completion=()
+    local flags_completion=()
+    local commands=("buf")
+    local command_aliases=()
+    local must_have_one_flag=()
+    local must_have_one_noun=()
+    local has_completion_function=""
+    local last_command=""
+    local nouns=()
+    local noun_aliases=()
+
+    __buf_handle_word
+}
+
+if [[ $(type -t compopt) = "builtin" ]]; then
+    complete -o default -F __start_buf buf
+else
+    complete -o default -o nospace -F __start_buf buf
+fi
+
+# ex: ts=4 sw=4 et filetype=sh

@@ -1,0 +1,11 @@
+version: v1
+deps:
+  - buf.build/googleapis/googleapis  # 引入 Google 官方 API 库
+lint:
+  use:
+    - DEFAULT
+breaking:
+  use:
+    - FILE
+
+# 用于依赖管理配置

@@ -1,0 +1,11 @@
+
+current_node: "192.168.1.%d"
+cache_size: 100000
+replicas: 150
+
+redis:
+  addr: "127.0.0.1:6379"
+  
+natstat_bash: "netstat -anp"
+awk7_bash: "awk '{print $7}'"
+name_bash: "grep main"

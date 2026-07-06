@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package gnat.internal;
+
+// 定义生成的 Go 代码包路径，配合 buf.gen.yaml 使用
+option go_package = "./internalpb";
+
+// 内部节点间路由服务
+service InternalRouter {
+  // 跨节点转发车辆控制指令
+  rpc RelayCommand (RelayRequest) returns (RelayResponse);
+  
+  // 节点间健康检查（可选，用于连接池的保活机制）
+  rpc Ping (PingRequest) returns (PingResponse);
+}
+
+// 跨节点转发请求
+message RelayRequest {
+  // 链路追踪 ID，用于在分布式日志中串联整个指令下发链路
+  string trace_id = 1; 
+  
+  // 目标车辆 ID (如 VIN 码)
+  string device_id = 2; 
+  
+  // 下发的指令数据 (二进制格式，兼容 MQTT/TCP 等协议)
+  bytes payload = 3;    
+  
+  // 指令下发的超时时间戳 (Unix 毫秒)，防止跨节点转发后指令已过期
+  int64 expire_at = 4;  
+}
+
+// 跨节点转发响应
+message RelayResponse {
+  // 是否成功下发到车辆
+  bool success = 1;     
+  
+  // 附加信息或错误描述
+  string message = 2;   
+  
+  // 如果云端需要车辆同步返回数据，可在此字段中携带回传内容
+  bytes response_data = 3; 
+}
+
+// 健康检查请求
+message PingRequest {
+  string node_ip = 1;
+}
+
+// 健康检查响应
+message PingResponse {
+  int64 timestamp = 1;
+}

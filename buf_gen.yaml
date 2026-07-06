@@ -1,0 +1,14 @@
+version: v1
+plugins:
+  # 生成 Go 基础代码（消息序列化/反序列化）
+  - name: go
+    out: proto
+    opt: paths=source_relative
+  # 生成 gRPC 服务代码（服务接口和客户端）
+  - name: go-grpc
+    out: proto
+    opt:
+      - paths=source_relative
+      - require_unimplemented_servers=false
+
+# 定义生成 Go 基础代码和 gRPC 服务代码的插件
